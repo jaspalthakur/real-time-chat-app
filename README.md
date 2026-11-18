@@ -23,6 +23,22 @@ A full-featured, real-time chat application with a stunning modern UI, built wit
 - **Responsive design** — Slide-out sidebar with blur backdrop on mobile
 - **Glassmorphism UI** — Animated mesh gradients, blur effects, smooth transitions
 
+## 🌐 1-Click Netlify / Cloud Deployment
+
+ChatterBox includes built-in support for **Netlify** serverless deployment with managed Postgres (Neon/Netlify DB) or in-memory fallback!
+
+- **Frontend build:** Automatic React + Vite compilation to `frontend/dist`
+- **Serverless API:** High-speed Netlify Function (`netlify/functions/api.js`) providing all REST and chat endpoints
+- **Database:** Auto-configures PostgreSQL tables with `@neondatabase/serverless` when `DATABASE_URL` or `NETLIFY_DATABASE_URL` is present, or falls back seamlessly to in-memory store
+- **Real-Time Sync:** Dual-engine architecture with WebSockets + smart polling fallback and auto-reconnect
+
+To deploy:
+1. Push to your GitHub repo
+2. Connect your repo in [Netlify](https://app.netlify.com/)
+3. Netlify will detect `netlify.toml` automatically and build both the frontend and serverless API!
+
+---
+
 ## 🛠️ Tech Stack
 
 | Layer | Technology |

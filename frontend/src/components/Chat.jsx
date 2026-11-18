@@ -6,7 +6,14 @@ import {
 } from 'lucide-react';
 import api from '../api';
 
-const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000';
+const getWsUrl = () => {
+  if (import.meta.env.VITE_WS_URL) return import.meta.env.VITE_WS_URL;
+  if (typeof window !== 'undefined' && window.location.host) {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${proto}//${window.location.host}`;
+  }
+  return 'ws://localhost:8000';
+};
 
 /* ───────────────── Helpers ───────────────── */
 
@@ -121,53 +128,146 @@ export default function Chat({ user, onLogout }) {
     return () => clearInterval(id);
   }, []);
 
+  /* ── poll messages periodically for reliable real-time sync ── */
   useEffect(() => {
     if (!activeRoom) return;
-    api.get(`/rooms/${activeRoom.id}/messages/`).then(r => setMessages(r.data)).catch(() => {});
+    const fetchMsgs = async () => {
+      try {
+        const res = await api.get(`/rooms/${activeRoom.id}/messages/`);
+        setMessages(prev => {
+          // Merge and deduplicate by id or timestamp+sender
+          const seen = new Set();
+          const combined = [...prev, ...res.data];
+          return combined.filter(m => {
+            const key = m.id ? `id-${m.id}` : `${m.sender_name}-${m.timestamp}-${m.content}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          });
+        });
+      } catch {}
+    };
+
+    fetchMsgs();
+    const interval = setInterval(fetchMsgs, 2500);
+    return () => clearInterval(interval);
   }, [activeRoom]);
 
   useEffect(() => {
     messagesEnd.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  /* ── WebSocket ── */
+  /* ── WebSocket with auto-reconnect ── */
   useEffect(() => {
     if (!activeRoom) return;
     const token = localStorage.getItem('access_token');
-    const socket = new WebSocket(`${WS_URL}/ws/chat/${activeRoom.id}/?token=${token}`);
-    socket.onmessage = (e) => {
-      const data = JSON.parse(e.data);
-      if (data.type === 'chat_message') {
-        setMessages(prev => [...prev, {
-          id: data.message_id, sender_name: data.username,
-          sender_avatar_color: data.avatar_color, content: data.message, timestamp: data.timestamp,
-        }]);
-        setTypingUsers(prev => prev.filter(u => u !== data.username));
-      } else if (data.type === 'typing') {
-        if (data.username === user.username) return;
-        setTypingUsers(prev => data.is_typing
-          ? [...new Set([...prev, data.username])]
-          : prev.filter(u => u !== data.username));
-      } else if (data.type === 'user_status') {
-        setOnlineUsers(prev => {
-          if (data.is_online) return prev.find(u => u.username === data.username) ? prev : [...prev, { username: data.username }];
-          return prev.filter(u => u.username !== data.username);
-        });
+    let socket = null;
+    let reconnectTimeout = null;
+
+    const connectWs = () => {
+      try {
+        const wsUrl = `${getWsUrl()}/ws/chat/${activeRoom.id}/?token=${token}`;
+        socket = new WebSocket(wsUrl);
+
+        socket.onopen = () => {
+          // Connected
+        };
+
+        socket.onmessage = (e) => {
+          try {
+            const data = JSON.parse(e.data);
+            if (data.type === 'chat_message') {
+              setMessages(prev => {
+                if (data.message_id && prev.some(m => m.id === data.message_id)) return prev;
+                return [...prev, {
+                  id: data.message_id,
+                  sender_name: data.username,
+                  sender_avatar_color: data.avatar_color,
+                  content: data.message,
+                  timestamp: data.timestamp || new Date().toISOString(),
+                }];
+              });
+              setTypingUsers(prev => prev.filter(u => u !== data.username));
+            } else if (data.type === 'typing') {
+              if (data.username === user.username) return;
+              setTypingUsers(prev => data.is_typing
+                ? [...new Set([...prev, data.username])]
+                : prev.filter(u => u !== data.username));
+            } else if (data.type === 'user_status') {
+              setOnlineUsers(prev => {
+                if (data.is_online) return prev.find(u => u.username === data.username) ? prev : [...prev, { username: data.username }];
+                return prev.filter(u => u.username !== data.username);
+              });
+            }
+          } catch {}
+        };
+
+        socket.onerror = () => {
+          // Socket error handled silently; HTTP polling handles message delivery
+        };
+
+        socket.onclose = () => {
+          // Attempt reconnection after 5s
+          reconnectTimeout = setTimeout(connectWs, 5000);
+        };
+
+        ws.current = socket;
+      } catch {
+        // Fallback gracefully to HTTP
       }
     };
-    ws.current = socket;
-    return () => socket.close();
+
+    connectWs();
+
+    return () => {
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (socket) socket.close();
+    };
   }, [activeRoom, user.username]);
 
   /* ── actions ── */
-  const sendMessage = () => {
+  const sendMessage = async () => {
     const text = newMsg.trim();
-    if (!text || !ws.current) return;
-    ws.current.send(JSON.stringify({ type: 'chat_message', message: text, username: user.username }));
+    if (!text || !activeRoom) return;
+
     setNewMsg('');
     setShowEmoji(false);
-    ws.current.send(JSON.stringify({ type: 'typing', username: user.username, is_typing: false }));
     inputRef.current?.focus();
+
+    // 1. Send via WebSocket if open
+    let wsSent = false;
+    if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+      try {
+        ws.current.send(JSON.stringify({ type: 'chat_message', message: text, username: user.username }));
+        ws.current.send(JSON.stringify({ type: 'typing', username: user.username, is_typing: false }));
+        wsSent = true;
+      } catch {}
+    }
+
+    // 2. Guaranteed persistence via REST API (essential for serverless & Netlify)
+    try {
+      const res = await api.post(`/rooms/${activeRoom.id}/messages/`, { content: text });
+      if (res.data) {
+        setMessages(prev => {
+          if (prev.some(m => m.id === res.data.id)) return prev;
+          return [...prev, res.data];
+        });
+      }
+    } catch (err) {
+      // If REST failed but WS sent or vice-versa, add optimistically
+      if (!wsSent) {
+        setMessages(prev => [
+          ...prev,
+          {
+            id: Date.now(),
+            sender_name: user.username,
+            sender_avatar_color: user.avatar_color,
+            content: text,
+            timestamp: new Date().toISOString(),
+          }
+        ]);
+      }
+    }
   };
 
   const handleTyping = (val) => {
